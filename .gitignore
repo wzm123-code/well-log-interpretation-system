@@ -1,0 +1,32 @@
+# 环境与敏感配置
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# 运行时生成文件（用户上传、报告、图表等）
+backend/static/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 测试与工具
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/

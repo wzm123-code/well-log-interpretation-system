@@ -1,0 +1,25 @@
+# --- Web & ASGI ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+Jinja2==3.1.4
+
+# --- LangChain / LangGraph / DeepSeek ---
+langchain-deepseek==0.1.0
+langgraph==0.2.39
+typing_extensions==4.12.2
+python-dotenv==1.0.1
+
+# --- Data & Excel ---
+pandas==2.2.3
+numpy==2.1.2
+openpyxl==3.1.5
+
+# --- Plotting / Visualization ---
+matplotlib==3.9.2
+seaborn==0.13.2
+plotly==5.24.1
+kaleido==0.2.1
+
+# --- 其他常用基础库（如后续扩展可用，可选） ---
+# requests==2.32.3
