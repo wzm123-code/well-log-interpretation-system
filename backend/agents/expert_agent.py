@@ -3,7 +3,7 @@
 
 【职责】
   - interpret_lithology、identify_reservoir：地质解释，输出 CSV
-  - plot_well_log_curves、plot_lithology_distribution、plot_crossplot、plot_heatmap、plot_reservoir_profile：matplotlib 输出 PNG
+  - plot_* 绘图：Plotly 输出 HTML（可交互）+ Matplotlib 输出同名 PNG（供 Word 报告嵌入）
 
 【调用方式】监督智能体通过 execute_tool 委派。绘图类工具受 _plot_semaphore 限制，最多 2 个并发，60 秒超时。
 """
@@ -12,9 +12,8 @@ import os
 import asyncio
 #导入第三方库
 from typing import Dict, Any
-from utils.agent_builder import build_agent, BaseAgentState
+from utils.agent_builder import build_agent
 from utils.agent_helpers import set_file_param
-from storage.memory.memory_saver import get_memory_saver
 from tools.interpretation_tools import interpret_lithology, identify_reservoir
 from tools.visualization_tools import (
     plot_well_log_curves,
@@ -29,7 +28,7 @@ EXPERT_AGENT_CONFIG = os.path.join(
     "../config/expert_agent_deepseek_config.json"
 )
 
-# 绘图类工具：限制并发数以降低 matplotlib 多线程冲突/卡顿
+# 绘图类工具：限制并发数以降低多线程下绘图/IO 压力
 PLOT_TOOLS = frozenset({
     "plot_well_log_curves", "plot_lithology_distribution", "plot_crossplot",
     "plot_heatmap", "plot_reservoir_profile",
@@ -54,8 +53,6 @@ def build_expert_agent(ctx=None):
         config_path=EXPERT_AGENT_CONFIG,
         tools=list(EXPERT_AGENT_TOOLS.values()),
         model_provider="deepseek",
-        checkpointer=get_memory_saver(),
-        state_schema=BaseAgentState,
         ctx=ctx
     )
 

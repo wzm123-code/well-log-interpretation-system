@@ -4,13 +4,18 @@
 将 supervisor_agent 中的纯函数封装到此模块，便于复用与维护。
 """
 import ast
+import logging
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from docx import Document
 from docx.shared import Inches, Pt, Cm
+
+from tools.data_loader import load_dataframe, resolve_column
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- 路径与数据链 ----------
@@ -27,6 +32,8 @@ def extract_data_files(work_dir: str) -> List[Dict[str, str]]:
     labels = (
         ("_cleaned.csv", "清洗后数据"),
         ("_minmax_normalized.csv", "归一化数据"),
+        ("_standard_normalized.csv", "归一化数据"),
+        ("_robust_normalized.csv", "归一化数据"),
         ("_zscore_normalized.csv", "归一化数据"),
         ("_normalized.csv", "归一化数据"),
         ("_lithology.csv", "岩性解释结果"),
@@ -250,6 +257,91 @@ def validate_well_log_data(preview_result: str, cols_list: list) -> tuple:
     return True, None
 
 
+def validate_plot_task_feasibility(
+    tool_name: str, input_path: str, params: Optional[Dict] = None
+) -> tuple:
+    """
+    绘图前可行性校验：若数据无法支持该图表，则跳过执行并返回原因。
+    返回 (can_run: bool, skip_reason: str)。can_run=True 时 skip_reason 为空。
+    """
+    plot_tools = {
+        "plot_well_log_curves",
+        "plot_lithology_distribution",
+        "plot_crossplot",
+        "plot_heatmap",
+        "plot_reservoir_profile",
+    }
+    if tool_name not in plot_tools:
+        return True, ""
+
+    params = params or {}
+    try:
+        df = load_dataframe(input_path)
+    except Exception as e:
+        return False, f"无法读取数据文件: {e}"
+
+    cols = list(df.columns)
+    numeric_cols = [c for c in cols if c in df.select_dtypes(include=["number"]).columns]
+
+    def _find_depth():
+        for c in cols:
+            cl = (c or "").lower()
+            if "depth" in cl or "深度" in cl:
+                return c
+        return resolve_column(df, "depth") or resolve_column(df, "Depth") or ""
+
+    depth_col = _find_depth()
+
+    if tool_name == "plot_well_log_curves":
+        if not depth_col:
+            return False, "数据中未找到深度列，无法绘制测井曲线图"
+        if len(numeric_cols) <= 1 or (len(numeric_cols) == 1 and depth_col in numeric_cols):
+            return False, "除深度外无其他数值曲线，无法绘制测井曲线图"
+        return True, ""
+
+    if tool_name == "plot_lithology_distribution":
+        lith_col = resolve_column(df, params.get("lithology_column", "Lithology"))
+        if not lith_col:
+            for cand in ("Lithology", "lithology", "岩性"):
+                lith_col = resolve_column(df, cand)
+                if lith_col:
+                    break
+        if not lith_col:
+            return False, "数据中未找到岩性列，无法绘制岩性分布图（需先执行岩性解释）"
+        return True, ""
+
+    if tool_name == "plot_crossplot":
+        x_param = params.get("x_parameter") or params.get("x") or ""
+        y_param = params.get("y_parameter") or params.get("y") or ""
+        if not x_param or not y_param:
+            return False, "未指定交会图的 x 或 y 参数"
+        x_col = resolve_column(df, x_param) or (x_param if x_param in cols else "")
+        y_col = resolve_column(df, y_param) or (y_param if y_param in cols else "")
+        if not x_col:
+            return False, f"未找到 x 轴参数列 '{x_param}'，可用列: {', '.join(cols[:15])}{'...' if len(cols) > 15 else ''}"
+        if not y_col:
+            return False, f"未找到 y 轴参数列 '{y_param}'，可用列: {', '.join(cols[:15])}{'...' if len(cols) > 15 else ''}"
+        if x_col not in numeric_cols or y_col not in numeric_cols:
+            return False, "交会图要求 x、y 参数均为数值列"
+        return True, ""
+
+    if tool_name == "plot_heatmap":
+        if len(numeric_cols) < 2:
+            return False, "相关性热力图需要至少 2 个数值列，当前数据不满足"
+        return True, ""
+
+    if tool_name == "plot_reservoir_profile":
+        if not depth_col:
+            return False, "数据中未找到深度列，无法绘制储层剖面图"
+        gr_col = resolve_column(df, "GR") or resolve_column(df, "gr")
+        poro_col = resolve_column(df, "Porosity") or resolve_column(df, "PHIT") or resolve_column(df, "porosity")
+        if not gr_col and not poro_col and len(numeric_cols) <= 1:
+            return False, "数据中既无 GR 也无孔隙度等曲线，无法绘制储层剖面图"
+        return True, ""
+
+    return True, ""
+
+
 # ---------- 文本处理 ----------
 
 def strip_task_json(text: str) -> str:
@@ -342,19 +434,39 @@ def build_interpretation_report_docx(
             else:
                 doc.add_paragraph(clean(stripped))
 
-        png_charts = [
+        chart_files = [
             f for f in os.listdir(work_dir)
-            if f.endswith(".png") and f != os.path.basename(file_path) and not f.startswith(".")
+            if (
+                f.endswith((".png", ".html"))
+                and f != os.path.basename(file_path)
+                and not f.startswith(".")
+            )
         ]
-        if png_charts:
+        # 按「同名无后缀」分组：解释报告优先嵌入静态 PNG（与 Plotly 导出的 HTML 成对出现）
+        stems: Dict[str, List[str]] = {}
+        for f in chart_files:
+            stem, _ = os.path.splitext(f)
+            stems.setdefault(stem, []).append(f)
+
+        if stems:
             doc.add_heading("图表", level=1)
-            for f in sorted(png_charts):
+            for stem in sorted(stems.keys()):
                 try:
-                    img_path = os.path.join(work_dir, f)
-                    if os.path.isfile(img_path):
-                        title = os.path.splitext(f)[0].replace("_", " ").strip()
-                        doc.add_paragraph(title, style="Normal")
-                        doc.add_picture(img_path, width=Inches(5.5))
+                    files = stems[stem]
+                    png_f = next((x for x in files if x.lower().endswith(".png")), None)
+                    html_f = next((x for x in files if x.lower().endswith(".html")), None)
+                    title = stem.replace("_", " ").strip()
+                    doc.add_paragraph(title, style="Normal")
+                    if png_f:
+                        chart_path = os.path.join(work_dir, png_f)
+                        if os.path.isfile(chart_path):
+                            doc.add_picture(chart_path, width=Inches(5.5))
+                            doc.add_paragraph()
+                    elif html_f:
+                        doc.add_paragraph(
+                            "（本图仅有交互式 HTML，请在 Web 界面「可视化」区域查看；静态 PNG 未生成时可检查绘图日志。）",
+                            style="Normal",
+                        )
                         doc.add_paragraph()
                 except Exception:
                     pass

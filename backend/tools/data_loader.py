@@ -60,3 +60,14 @@ def load_dataframe(file_path: str) -> pd.DataFrame:
         return _read_csv_safe(file_path)
     except Exception:
         return pd.read_excel(file_path)
+
+
+def resolve_column(df: pd.DataFrame, name: str) -> str:
+    """解析列名，支持大小写不敏感匹配。"""
+    if not name or name in df.columns:
+        return name or ""
+    lower = name.lower()
+    for col in df.columns:
+        if col.lower() == lower:
+            return col
+    return ""

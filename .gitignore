@@ -16,6 +16,9 @@ env/
 # 运行时生成文件（用户上传、报告、图表等）
 backend/static/
 
+# 对话历史持久化数据库
+backend/data/
+
 # IDE
 .idea/
 .vscode/

@@ -8,14 +8,12 @@
 
 【调用方式】监督智能体通过 execute_tool(tool_name, parameters, file_path) 委派，不对外暴露 execute_task。
 """
-#导入标准库
-import os#操作文件和目录
-import asyncio#异步编程
+import os
+import asyncio  
 #导入第三方库
 from typing import Dict, Any
-from utils.agent_builder import build_agent, BaseAgentState
+from utils.agent_builder import build_agent
 from utils.agent_helpers import set_file_param
-from storage.memory.memory_saver import get_memory_saver
 
 # 导入工具
 from tools.data_processing_tools import preview_data, clean_data, normalize_data
@@ -40,8 +38,6 @@ def build_data_agent(ctx=None):
         config_path=DATA_AGENT_CONFIG,
         tools=list(DATA_AGENT_TOOLS.values()),
         model_provider="deepseek",
-        checkpointer=get_memory_saver(),
-        state_schema=BaseAgentState,
         ctx=ctx
     )
 

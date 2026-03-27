@@ -1,6 +1,11 @@
-"""Excel 转 CSV 工具，统一分析流程中的文件格式"""
-import os
+"""
+Excel 转 CSV 工具 - 统一分析流程中的文件格式
+
+支持 .xlsx / .xls，输出 UTF-8 BOM CSV 便于 downstream 工具读取。
+"""
 import logging
+import os
+
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -8,8 +13,14 @@ logger = logging.getLogger(__name__)
 
 def excel_to_csv(file_path: str, suffix: str = "_data") -> str:
     """
-    若为 Excel 文件，转换为 CSV 并返回 CSV 路径。
-    suffix: 输出文件后缀，如 _data 得 xxx_data.csv，_workflow 得 xxx_workflow.csv
+    若为 Excel 文件，转换为 CSV 并返回新路径；已是 CSV 则原样返回。
+
+    参数:
+        file_path: 输入文件路径
+        suffix: 输出文件名后缀，如 _data -> xxx_data.csv，_workflow -> xxx_workflow.csv
+
+    返回:
+        CSV 文件路径
     """
     if not file_path or not os.path.exists(file_path):
         return file_path

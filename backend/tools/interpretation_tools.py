@@ -10,21 +10,10 @@ import numpy as np
 from langchain_core.tools import tool
 import logging
 
-from tools.data_loader import load_dataframe
+from tools.data_loader import load_dataframe, resolve_column
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def _resolve_column(df: pd.DataFrame, name: str) -> str:
-    """解析列名，支持大小写不敏感匹配。"""
-    if not name or name in df.columns:
-        return name or ""
-    lower = name.lower()
-    for col in df.columns:
-        if col.lower() == lower:
-            return col
-    return ""
 
 
 @tool
@@ -45,9 +34,9 @@ def interpret_lithology(data_path: str, gr_column: str = "GR", density_column: s
     try:
         df = load_dataframe(data_path)
 
-        gr_col = _resolve_column(df, gr_column) or (gr_column if gr_column in df.columns else "")
-        den_col = _resolve_column(df, density_column) or (density_column if density_column in df.columns else "")
-        neu_col = _resolve_column(df, neutron_column) or (neutron_column if neutron_column in df.columns else "")
+        gr_col = resolve_column(df, gr_column) or (gr_column if gr_column in df.columns else "")
+        den_col = resolve_column(df, density_column) or (density_column if density_column in df.columns else "")
+        neu_col = resolve_column(df, neutron_column) or (neutron_column if neutron_column in df.columns else "")
         if not gr_col:
             return f"错误: 未找到伽马射线列 '{gr_column}'。可用列: {', '.join(df.columns.tolist())}"
         gr = df[gr_col]
@@ -94,10 +83,15 @@ def interpret_lithology(data_path: str, gr_column: str = "GR", density_column: s
         for rock_type, percentage in lithology_stats.items():
             result += f"- {rock_type}: {percentage*100:.2f}%\n"
 
-        result += f"""
-        【岩性分类规则】
-        - GR < 50, 密度 > 2.65: 石灰岩 (Limestone)
-        - GR < 50, 密度 ≤ 2.65: 砂岩 (Sandstone)
+        result += """
+        【曲线物性依据（供报告撰写引用）】
+        - 自然伽马(GR)：主要反映泥质含量与放射性矿物，高值多对应泥质岩类，低值多对应净砂岩或碳酸盐岩（需结合密度等）
+        - 体积密度(DEN)：反映岩石骨架与孔隙流体综合效应，碳酸盐岩骨架密度通常较高，可与 GR、中子交会区分岩性
+        - 中子(CNL)：对含氢指数敏感，在岩性识别中常与密度交会；本工具若未用中子参与阈值，报告中可说明留作交会或质量监控
+
+        【岩性分类规则（本算法阈值）】
+        - GR < 50 且 密度 > 2.65 g/cm³: 石灰岩 (Limestone)；无密度列时灰岩判识退化为不启用
+        - GR < 50 且 密度 ≤ 2.65 或无密度: 砂岩 (Sandstone)
         - GR > 100: 泥岩 (Shale)
         - 50 ≤ GR ≤ 100: 粉砂岩 (Siltstone)
 
@@ -130,8 +124,8 @@ def identify_reservoir(data_path: str, porosity_column: str = "Porosity", permea
     try:
         df = load_dataframe(data_path)
 
-        poro_col = _resolve_column(df, porosity_column) or porosity_column
-        perm_col = _resolve_column(df, permeability_column) or permeability_column
+        poro_col = resolve_column(df, porosity_column) or porosity_column
+        perm_col = resolve_column(df, permeability_column) or permeability_column
         porosity = df.get(poro_col) if poro_col else None
         permeability = df.get(perm_col) if perm_col else None
 

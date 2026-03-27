@@ -1,0 +1,30 @@
+# 适用于 .venv 虚拟环境的依赖（解决版本冲突）
+# 在项目根目录执行: .venv\Scripts\pip install -r requirements-venv.txt
+
+# LangChain / DeepSeek（兼容版本组合）
+langchain-core==0.3.83
+langchain-deepseek==0.1.0
+langgraph==0.2.39
+langchain>=0.3,<0.4
+
+# Web
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Data & Excel
+pandas>=2.2.0
+numpy>=2.0.0
+openpyxl>=3.1.0
+
+# Plotting
+matplotlib>=3.9.0
+seaborn>=0.13.0
+plotly>=5.24.0
+
+# Utils
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Streamlit 前端（可选：streamlit run frontend/main.py）
+streamlit>=1.33.0
