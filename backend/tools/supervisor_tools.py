@@ -38,6 +38,8 @@ def extract_data_files(work_dir: str) -> List[Dict[str, str]]:
         ("_normalized.csv", "归一化数据"),
         ("_lithology.csv", "岩性解释结果"),
         ("_reservoir.csv", "储层识别结果"),
+        ("_mud_gas_zones.csv", "录井气测高值段汇总"),
+        ("_mud_gas_metrics.csv", "录井气测逐点指标"),
     )
     for f in sorted(os.listdir(work_dir)):
         if not f.endswith(".csv"):
@@ -65,6 +67,8 @@ def compute_tool_output_path(input_path: str, tool_name: str, params: Optional[D
         return os.path.join(dir_name, f"{name}_lithology.csv")
     if tool_name == "identify_reservoir":
         return os.path.join(dir_name, f"{name}_reservoir.csv")
+    if tool_name == "analyze_mud_gas_survey":
+        return os.path.join(dir_name, f"{name}_mud_gas_zones.csv")
     return input_path
 
 
@@ -189,6 +193,49 @@ def _is_monotonic_numeric(values: list) -> bool:
     return all_pos or all_neg
 
 
+def _normalize_col_name(name: str) -> str:
+    """列名标准化：统一大小写并去除常见分隔符，便于别名匹配。"""
+    if not name:
+        return ""
+    s = str(name).strip().lower()
+    # 去掉空格、下划线、连字符、斜杠、括号等常见符号
+    return re.sub(r"[\s_\-()/\\]+", "", s)
+
+
+def _contains_any_alias(col_name: str, aliases: set) -> bool:
+    """判断标准化列名是否命中某类曲线别名。"""
+    norm = _normalize_col_name(col_name)
+    if not norm:
+        return False
+    if norm in aliases:
+        return True
+    # 允许部分包含（如 depth_m、grapi、deepresistivity 等）
+    for a in aliases:
+        if a and (a in norm or norm in a):
+            return True
+    return False
+
+
+def _column_has_resistivity(col_name: str) -> bool:
+    """
+    识别电阻率曲线列：RT/ILD/LLD 及 R10、R20、R90、Rx 等编号命名。
+    """
+    norm = _normalize_col_name(col_name)
+    if not norm:
+        return False
+    res_aliases = {
+        "rt", "resistivity", "电阻率", "ild", "lld", "lls", "rdeep", "rshallow",
+        "deepresistivity", "shallowresistivity", "rd", "rs", "rxo", "rxoohm",
+    }
+    if _contains_any_alias(col_name, res_aliases):
+        return True
+    if re.match(r"^r\d{1,4}$", norm):
+        return True
+    if norm.startswith("rx") and len(norm) <= 5:
+        return True
+    return False
+
+
 def validate_well_log_data(preview_result: str, cols_list: list) -> tuple:
     """
     基于数据结构智能校验是否为测井/地质数据。
@@ -196,6 +243,46 @@ def validate_well_log_data(preview_result: str, cols_list: list) -> tuple:
     """
     if not cols_list or len(cols_list) < 2:
         return False, "数据列数过少，请确认是否为测井数据文件。"
+
+    # 必备测井参数（支持中英文与常见缩写）
+    required_groups = [
+        ("深度", {
+            "depth", "深度", "md", "tvd", "井深", "测深", "depthm", "depthft",
+        }),
+        ("伽马", {
+            "gr", "gammaray", "gamma", "自然伽马", "伽马", "自然伽玛", "cgr",
+        }),
+        ("电阻率", {
+            "rt", "resistivity", "电阻率", "ild", "lld", "lls", "rdeep", "rshallow",
+            "deepresistivity", "shallowresistivity", "rd", "rs", "rxo", "rxoohm",
+        }),
+        ("中子", {
+            "cnl", "nphi", "neutron", "中子", "中子孔隙度", "neu", "phin", "cn",
+        }),
+        ("密度", {
+            "den", "rhob", "density", "密度", "体积密度", "bulkdensity",
+        }),
+        ("声波时差", {
+            "dt", "ac", "sonic", "deltat", "声波", "声波时差", "时差", "dtco",
+        }),
+    ]
+
+    missing_groups = []
+    for group_name, aliases in required_groups:
+        if group_name == "电阻率":
+            has_group = any(_column_has_resistivity(c) for c in cols_list)
+        else:
+            has_group = any(_contains_any_alias(c, aliases) for c in cols_list)
+        if not has_group:
+            missing_groups.append(group_name)
+
+    if missing_groups:
+        return False, (
+            "当前文件缺少测井解释必需参数，无法进行岩性解释/储层识别。"
+            f"\n缺失项：{', '.join(missing_groups)}"
+            "\n必需参数：深度、伽马(GR)、电阻率(RT/LLD/LLS 等)、中子(CNL/NPHI)、密度(DEN/RHOB)、声波时差(DT/AC)。"
+            "\n请上传包含以上关键曲线的 CSV/Excel。"
+        )
 
     col_dtypes, col_samples = parse_preview_metadata(preview_result)
 
@@ -257,6 +344,46 @@ def validate_well_log_data(preview_result: str, cols_list: list) -> tuple:
     return True, None
 
 
+def validate_mud_logging_data(cols_list: list) -> tuple:
+    """
+    校验是否为录井气测类表（深度 + 钻时 + 气测组分/全烃）。
+    返回 (True, None) 通过；(False, 提示信息) 不通过。
+    """
+    if not cols_list or len(cols_list) < 3:
+        return False, "录井气测数据列数过少（至少需要深度、钻时与气测相关列）。"
+
+    depth_aliases = {
+        "depth", "深度", "md", "tvd", "井深", "测深", "dept", "mdft",
+    }
+    rop_aliases = {"rop", "钻时", "机械钻速", "钻速", "drillingtime"}
+    has_depth = any(_contains_any_alias(c, depth_aliases) for c in cols_list)
+    has_rop = any(_contains_any_alias(c, rop_aliases) for c in cols_list)
+    has_gas = False
+    for c in cols_list:
+        nc = _normalize_col_name(c)
+        if nc in ("tg", "c1", "c2", "c3", "co2", "other", "全烃", "全量", "甲烷"):
+            has_gas = True
+            break
+        if _contains_any_alias(
+            c,
+            {"tg", "甲烷", "全烃", "全量", "气测", "乙烷", "丙烷", "丁烷", "戊烷", "二氧化碳", "非烃", "烃"},
+        ):
+            has_gas = True
+            break
+        uc = str(c).strip().upper()
+        if re.match(r"^(C[1-5]|IC4|NC4|IC5|NC5|TG|CO2|OTHER)$", uc):
+            has_gas = True
+            break
+
+    if not has_depth:
+        return False, "未识别到深度列（井深、Depth、MD 等）。录井气测表需要深度索引。"
+    if not has_gas:
+        return False, "未识别到气测相关列（如 Tg/全烃、C1 甲烷、C2…C5 等）。"
+    if not has_rop:
+        return False, "未识别到钻时列（Rop、钻时）。录井分析建议同时包含钻时与气测数据。"
+    return True, None
+
+
 def validate_plot_task_feasibility(
     tool_name: str, input_path: str, params: Optional[Dict] = None
 ) -> tuple:
@@ -270,6 +397,7 @@ def validate_plot_task_feasibility(
         "plot_crossplot",
         "plot_heatmap",
         "plot_reservoir_profile",
+        "plot_mud_gas_profile",
     }
     if tool_name not in plot_tools:
         return True, ""
@@ -339,6 +467,14 @@ def validate_plot_task_feasibility(
             return False, "数据中既无 GR 也无孔隙度等曲线，无法绘制储层剖面图"
         return True, ""
 
+    if tool_name == "plot_mud_gas_profile":
+        if not depth_col:
+            return False, "数据中未找到深度列，无法绘制录井气测剖面"
+        non_depth_numeric = [c for c in numeric_cols if c != depth_col]
+        if len(non_depth_numeric) < 1:
+            return False, "除深度外无钻时/气测数值列，无法绘制录井气测剖面"
+        return True, ""
+
     return True, ""
 
 
@@ -364,6 +500,47 @@ def strip_task_json(text: str) -> str:
             rest = stripped[end + 1 :].lstrip()
             text = strip_task_json(rest) if rest.startswith("{") else rest
     return text.strip()
+
+
+def streamable_text_for_report(buffer: str) -> Tuple[str, str]:
+    """
+    流式生成报告时：从累积缓冲中取出「可立即推送到前端」的正文，去掉开头的任务规划 JSON、```json``` 围栏等。
+
+    若开头为未闭合的围栏或未闭合的 `{...}`，返回 ("", buffer)，不向用户展示。
+
+    返回 (emit, carry)：emit 为本次应推送的片段；carry 为尚未展示的后缀缓冲。
+    """
+    if not buffer:
+        return "", ""
+    b = buffer
+    # 1) 去掉开头的完整 markdown 代码围栏（常为 ```json ... ```）
+    while True:
+        stripped = b.lstrip()
+        if not stripped.startswith("```"):
+            break
+        nl = stripped.find("\n", 3)
+        if nl < 0:
+            return "", buffer
+        rest_after_lang = stripped[nl + 1 :]
+        close = rest_after_lang.find("```")
+        if close < 0:
+            return "", buffer
+        b = b[: len(b) - len(stripped)] + rest_after_lang[close + 3 :]
+
+    stripped = b.lstrip()
+    ws_lead = b[: len(b) - len(stripped)]
+    if not stripped.startswith("{"):
+        return b, ""
+    depth = 0
+    for i, c in enumerate(stripped):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                rest = ws_lead + stripped[i + 1 :]
+                return streamable_text_for_report(rest)
+    return "", buffer
 
 
 # ---------- 报告生成 ----------

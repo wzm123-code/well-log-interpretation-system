@@ -10,10 +10,53 @@ import numpy as np
 from langchain_core.tools import tool
 import logging
 
-from tools.data_loader import load_dataframe
+from tools.data_loader import load_dataframe, resolve_column
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _resolve_depth_column_name(df: pd.DataFrame) -> str:
+    for cand in ("Depth", "depth", "DEPTH", "MD", "TVD", "DEPT", "井深", "测深"):
+        c = resolve_column(df, cand) or (cand if cand in df.columns else "")
+        if c and c in df.columns:
+            return c
+    return ""
+
+
+def _resolve_gr_column_name(df: pd.DataFrame) -> str:
+    for cand in ("GR", "Gr", "gr", "伽马", "自然伽马"):
+        c = resolve_column(df, cand) or (cand if cand in df.columns else "")
+        if c and c in df.columns:
+            return c
+    return ""
+
+
+def _drop_missing_rows_well_log(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """
+    mode:
+      - key_curves: 仅删除「深度或 GR 缺失」的行（测井常规：各曲线可缺，不应因某一列空删整行）
+      - any_column: 任一行任一列有 NaN 即删（旧行为，易把数据删光）
+    """
+    if mode == "any_column":
+        return df.dropna()
+    depth_c = _resolve_depth_column_name(df)
+    gr_c = _resolve_gr_column_name(df)
+    subset = [c for c in (depth_c, gr_c) if c]
+    if subset:
+        out = df.dropna(subset=subset, how="any")
+        logger.info(
+            "clean_data: 按关键列删行 subset=%s, 行数 %d -> %d",
+            subset,
+            len(df),
+            len(out),
+        )
+        return out
+    # 无深度/GR 列名时：退化为「至少半数列非空」保留行，避免删光
+    if len(df.columns) == 0:
+        return df
+    thresh = max(1, len(df.columns) // 4)
+    return df.dropna(thresh=thresh)
 
 
 @tool
@@ -65,17 +108,26 @@ def preview_data(file_path: str, n_rows: int = 5) -> str:
 
 
 @tool
-def clean_data(file_path: str, handle_missing: str = "drop", remove_outliers: bool = False, numeric_columns: str = None) -> str:
+def clean_data(
+    file_path: str,
+    handle_missing: str = "drop",
+    remove_outliers: bool = False,
+    numeric_columns: str = None,
+    drop_scope: str = "key_curves",
+) -> str:
     """
     数据清洗：处理缺失值、异常值等
 
     参数:
         file_path: 输入文件路径（支持CSV、Excel格式）
         handle_missing: 缺失值处理方式
-            - "drop": 删除包含缺失值的行（默认）
+            - "drop": 删除行（默认与 drop_scope 配合，见下）
             - "fill": 前向填充缺失值
         remove_outliers: 是否移除异常值（使用IQR方法）
         numeric_columns: 需要处理异常值的数值列列表（逗号分隔的字符串）
+        drop_scope: 当 handle_missing="drop" 时生效
+            - "key_curves"（默认）：仅删除「深度或自然伽马」缺失的行，其余列为空保留（测井数据常见）
+            - "any_column": 任一行任一列有 NaN 即删（旧行为，易导致清洗后行数为 0）
 
     返回:
         清洗结果摘要
@@ -90,10 +142,14 @@ def clean_data(file_path: str, handle_missing: str = "drop", remove_outliers: bo
         original_rows = len(df)
         original_missing = df.isnull().sum().sum()
 
-        # 处理缺失值
-        if handle_missing == 'drop':
-            df = df.dropna()
-        elif handle_missing == 'fill':
+        # 处理缺失值（测井数据勿用全表 dropna，否则各曲线分段缺失会导致整表被删空）
+        if handle_missing == "drop":
+            scope = (drop_scope or "key_curves").strip().lower()
+            if scope == "any_column":
+                df = _drop_missing_rows_well_log(df, "any_column")
+            else:
+                df = _drop_missing_rows_well_log(df, "key_curves")
+        elif handle_missing == "fill":
             df = df.ffill()
 
         # 处理异常值
@@ -115,15 +171,25 @@ def clean_data(file_path: str, handle_missing: str = "drop", remove_outliers: bo
         output_filename = f"{name}_cleaned.csv"
         output_path = os.path.join(dir_name, output_filename)
         os.makedirs(dir_name, exist_ok=True)
-        df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
         cleaned_rows = len(df)
+        if cleaned_rows == 0:
+            return (
+                "错误: 清洗后有效行数为 0，未写入文件。\n"
+                "原因多为：handle_missing=\"drop\" 且深度/GR 全部缺失，或曾使用「任意列有缺失即删」把数据删光。\n"
+                "建议：使用 drop_scope=\"key_curves\"（默认，仅删深度或 GR 缺失行），或 handle_missing=\"fill\"，"
+                "或跳过清洗直接进行岩性解释（interpret_lithology 会自行处理无效占位）。\n"
+                f"输入行数: {original_rows}"
+            )
+
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
         cleaned_missing = df.isnull().sum().sum()
 
         result = f"""
         === 数据清洗完成 ===
         输入文件: {file_path}
         输出文件: {output_path}
+        缺失处理: handle_missing={handle_missing}, drop_scope={drop_scope if handle_missing == 'drop' else '—'}
 
         【清洗前】
         行数: {original_rows}

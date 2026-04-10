@@ -30,7 +30,9 @@ from tools.supervisor_tools import (
     extract_data_files,
     extract_report_only,
     get_columns_list_from_preview,
+    streamable_text_for_report,
     strip_task_json,
+    validate_mud_logging_data,
     validate_plot_task_feasibility,
     validate_well_log_data,
 )
@@ -54,14 +56,17 @@ STATIC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "stat
 TOOL_AGENT_MAP = {
     "preview_data": "data", "clean_data": "data", "normalize_data": "data",
     "interpret_lithology": "expert", "identify_reservoir": "expert",
+    "analyze_mud_gas_survey": "expert",
     "plot_well_log_curves": "expert", "plot_lithology_distribution": "expert",
+    "plot_mud_gas_profile": "expert",
     "plot_crossplot": "expert", "plot_heatmap": "expert", "plot_reservoir_profile": "expert",
 }
 # 任务层级：数值越小越先执行；同层级任务可并行（0=预览, 1=清洗/归一化, 2=岩性/储层, 3=绘图）
 TASK_TIER = {
     "preview_data": 0, "clean_data": 1, "normalize_data": 1,
-    "interpret_lithology": 2, "identify_reservoir": 2,
+    "interpret_lithology": 2, "identify_reservoir": 2, "analyze_mud_gas_survey": 2,
     "plot_well_log_curves": 3, "plot_lithology_distribution": 3,
+    "plot_mud_gas_profile": 3,
     "plot_crossplot": 3, "plot_heatmap": 3, "plot_reservoir_profile": 3,
 }
 """任务层级：0=preview，1=清洗/归一化，2=解释/储层，3=绘图；同层级任务可并行执行"""
@@ -83,12 +88,13 @@ def _parse_tasks_and_intent(content: str) -> Optional[tuple]:
         return None
 
 
-def _validate_and_sort_tasks(tasks: List[Dict]) -> List[Dict]:
+def _validate_and_sort_tasks(tasks: List[Dict], data_kind: str = "well_log") -> List[Dict]:
     """
     校验任务列表并补充依赖、按 TASK_TIER 排序。
 
     规则：
     - 过滤非法工具（不在 TOOL_AGENT_MAP 或为 preview_data）
+    - 录井气测数据（mud_logging）仅保留录井/通用绘图类工具，剔除测井解释类
     - 若有 interpret/identify 但无 clean_data，自动补 clean_data
     - 若有 plot_lithology_distribution 但无 interpret_lithology，自动补 interpret
     - 若有 plot_reservoir_profile，自动补 identify_reservoir 与 interpret_lithology
@@ -101,47 +107,112 @@ def _validate_and_sort_tasks(tasks: List[Dict]) -> List[Dict]:
         if name and name in TOOL_AGENT_MAP and name != "preview_data":
             valid.append(t)
             names.add(name)
+    if data_kind == "mud_logging":
+        mud_allow = {
+            "clean_data",
+            "normalize_data",
+            "analyze_mud_gas_survey",
+            "plot_mud_gas_profile",
+            "plot_crossplot",
+            "plot_heatmap",
+        }
+        valid = [t for t in valid if t.get("tool_name") in mud_allow]
+        names = {t.get("tool_name") for t in valid}
+    else:
+        valid = [
+            t
+            for t in valid
+            if t.get("tool_name") not in {"analyze_mud_gas_survey", "plot_mud_gas_profile"}
+        ]
+        names = {t.get("tool_name") for t in valid}
     data_only = names <= {"clean_data", "normalize_data"} and len(names) > 0
-    # 需要解释/储层时，必须先清洗
-    if not data_only and ("interpret_lithology" in names or "identify_reservoir" in names) and "clean_data" not in names:
-        valid.insert(0, {"tool_name": "clean_data", "parameters": {}})
-        names.add("clean_data")
-    # 岩性分布图依赖岩性解释结果
-    if "plot_lithology_distribution" in names and "interpret_lithology" not in names:
-        valid.append({"tool_name": "interpret_lithology", "parameters": {}})
-        names.add("interpret_lithology")
-    # 储层剖面图依赖储层识别和岩性解释
-    if "plot_reservoir_profile" in names:
-        if "identify_reservoir" not in names:
-            valid.append({"tool_name": "identify_reservoir", "parameters": {}})
-            names.add("identify_reservoir")
-        if "interpret_lithology" not in names:
+    if data_kind == "well_log":
+        # 解释/储层前可选清洗：仅删「深度或 GR 缺失」行（勿用全表 dropna，否则测井分段缺失会把行删光）
+        if not data_only and ("interpret_lithology" in names or "identify_reservoir" in names) and "clean_data" not in names:
+            valid.insert(
+                0,
+                {
+                    "tool_name": "clean_data",
+                    "parameters": {
+                        "handle_missing": "drop",
+                        "drop_scope": "key_curves",
+                    },
+                },
+            )
+            names.add("clean_data")
+        # 岩性分布图依赖岩性解释结果
+        if "plot_lithology_distribution" in names and "interpret_lithology" not in names:
             valid.append({"tool_name": "interpret_lithology", "parameters": {}})
             names.add("interpret_lithology")
+        # 储层剖面图依赖储层识别和岩性解释
+        if "plot_reservoir_profile" in names:
+            if "identify_reservoir" not in names:
+                valid.append({"tool_name": "identify_reservoir", "parameters": {}})
+                names.add("identify_reservoir")
+            if "interpret_lithology" not in names:
+                valid.append({"tool_name": "interpret_lithology", "parameters": {}})
+                names.add("interpret_lithology")
+    else:
+        # 录井：分析前可选清洗
+        if (
+            not data_only
+            and "analyze_mud_gas_survey" in names
+            and "clean_data" not in names
+        ):
+            valid.insert(
+                0,
+                {
+                    "tool_name": "clean_data",
+                    "parameters": {
+                        "handle_missing": "drop",
+                        "drop_scope": "key_curves",
+                    },
+                },
+            )
+            names.add("clean_data")
     valid.sort(key=lambda x: (TASK_TIER.get(x.get("tool_name"), 99), x.get("tool_name", "")))
     return valid
 
 
-def _apply_report_only_filter(tasks: List[Dict], report_only: bool, user_request: str) -> tuple:
+def _apply_report_only_filter(
+    tasks: List[Dict], report_only: bool, user_request: str, data_kind: str = "well_log"
+) -> tuple:
     """
     根据 report_only 过滤任务；解析失败时按关键词兜底。
 
-    report_only=True 时：移除所有 plot_*，移除无依赖的 interpret/identify，保留 interpret+identify 用于报告。
+    report_only=True 时：测井保留 interpret+identify；录井保留 analyze_mud_gas_survey。
     返回 (过滤后的 tasks, is_data_only)。
     """
     data_only_tools = {"clean_data", "normalize_data"}
     is_data_only = all(t.get("tool_name") in data_only_tools for t in tasks) and len(tasks) > 0
+    plot_tools = {
+        "plot_well_log_curves",
+        "plot_lithology_distribution",
+        "plot_mud_gas_profile",
+        "plot_crossplot",
+        "plot_heatmap",
+        "plot_reservoir_profile",
+    }
     if report_only and not is_data_only:
-        # 只要报告：移除绘图，保留 interpret+identify
-        plot_tools = {"plot_well_log_curves", "plot_lithology_distribution", "plot_crossplot", "plot_heatmap", "plot_reservoir_profile"}
-        tasks = [t for t in tasks if t.get("tool_name") not in plot_tools]
-        if not any(t.get("tool_name") == "plot_lithology_distribution" for t in tasks):
-            tasks = [t for t in tasks if t.get("tool_name") != "interpret_lithology"]
-        if not any(t.get("tool_name") == "plot_reservoir_profile" for t in tasks):
-            tasks = [t for t in tasks if t.get("tool_name") != "identify_reservoir"]
-        for tn in ["interpret_lithology", "identify_reservoir"]:
-            if not any(t.get("tool_name") == tn for t in tasks):
-                tasks.append({"tool_name": tn, "parameters": {}})
+        if data_kind == "mud_logging":
+            tasks = [t for t in tasks if t.get("tool_name") not in plot_tools]
+            tasks = [
+                t
+                for t in tasks
+                if t.get("tool_name") not in {"interpret_lithology", "identify_reservoir"}
+            ]
+            if not any(t.get("tool_name") == "analyze_mud_gas_survey" for t in tasks):
+                tasks.append({"tool_name": "analyze_mud_gas_survey", "parameters": {}})
+        else:
+            # 只要报告：移除绘图，保留 interpret+identify
+            tasks = [t for t in tasks if t.get("tool_name") not in plot_tools]
+            if not any(t.get("tool_name") == "plot_lithology_distribution" for t in tasks):
+                tasks = [t for t in tasks if t.get("tool_name") != "interpret_lithology"]
+            if not any(t.get("tool_name") == "plot_reservoir_profile" for t in tasks):
+                tasks = [t for t in tasks if t.get("tool_name") != "identify_reservoir"]
+            for tn in ["interpret_lithology", "identify_reservoir"]:
+                if not any(t.get("tool_name") == tn for t in tasks):
+                    tasks.append({"tool_name": tn, "parameters": {}})
         tasks.sort(key=lambda x: (TASK_TIER.get(x.get("tool_name"), 99), x.get("tool_name", "")))
     # 解析结果为空时，按用户关键词兜底
     if not tasks:
@@ -322,11 +393,25 @@ class SupervisorAgent:
 
         llm = self._get_report_llm()
         full_content: List[str] = []
+        carry = ""
         async for chunk in llm.astream(messages):
             if hasattr(chunk, "content") and chunk.content:
-                full_content.append(chunk.content)
-                await event_callback({"type": "summary_chunk", "content": chunk.content})
-        return "".join(full_content)
+                carry += chunk.content
+                while True:
+                    emit, carry = streamable_text_for_report(carry)
+                    if not emit:
+                        break
+                    full_content.append(emit)
+                    await event_callback({"type": "summary_chunk", "content": emit})
+        # 流结束后：若缓冲中仍有可剥离前缀，继续吐出
+        while True:
+            emit, carry = streamable_text_for_report(carry)
+            if not emit:
+                break
+            full_content.append(emit)
+            await event_callback({"type": "summary_chunk", "content": emit})
+        raw = "".join(full_content) + carry
+        return strip_task_json(raw)
 
     async def _summarize_web_search_result(
         self,
@@ -600,25 +685,65 @@ class SupervisorAgent:
                             "message": f"preview_data 执行失败: {str(e)}",
                         })
 
-            # ---------- 数据校验：若非测井数据，提前返回并提示 ----------
+            # ---------- 数据校验：测井 或 录井气测 ----------
             cols_list = get_columns_list_from_preview(preview_result)
             is_valid, valid_msg = validate_well_log_data(preview_result, cols_list)
+            data_kind = "well_log"
             if not is_valid:
-                await self._emit_workflow_log(event_callback, "数据格式校验未通过，返回说明（未执行后续工具）")
-                summary = f"数据格式提示\n\n{valid_msg}\n\n请您检查上传的文件内容，确认是否为测井数据（通常包含深度列及 GR、DEN、CNL 等测井曲线）。"
-                if event_callback:
-                    await event_callback({"type": "report_stream_start"})
-                    await event_callback({"type": "summary_chunk", "content": summary})
-                return {
-                    "status": "success",
-                    "summary": summary,
-                    "results": {"preview_data": preview_result},
-                    "charts": [],
-                    "has_report": False,
-                }
+                is_mud, mud_msg = validate_mud_logging_data(cols_list)
+                if is_mud:
+                    is_valid = True
+                    data_kind = "mud_logging"
+                    await self._emit_workflow_log(
+                        event_callback, "数据列符合录井气测表（深度+钻时+气测），进入录井分析流程"
+                    )
+                else:
+                    await self._emit_workflow_log(event_callback, "数据格式校验未通过，返回说明（未执行后续工具）")
+                    summary = (
+                        f"数据格式提示\n\n{valid_msg}\n\n"
+                        "若您上传的是录井气测表，请确认包含深度列（Depth/井深）、钻时（Rop/钻时）与气测列（如 Tg、C1、C2…）。\n"
+                        f"录井格式说明：{mud_msg}"
+                    )
+                    if event_callback:
+                        await event_callback({"type": "report_stream_start"})
+                        await event_callback({"type": "summary_chunk", "content": summary})
+                    return {
+                        "status": "success",
+                        "summary": summary,
+                        "results": {"preview_data": preview_result},
+                        "charts": [],
+                        "has_report": False,
+                    }
 
             # ---------- 第 1 步：LLM 任务规划，输出 JSON（report_only/charts_only/tasks）----------
-            analysis_prompt = f"""当前日期: {current_date}
+            if data_kind == "mud_logging":
+                analysis_prompt = f"""当前日期: {current_date}
+用户请求: {user_request}
+数据文件: {file_path}
+数据类型: 录井气测（钻时+全烃/组分，非测井曲线解释）
+
+【数据列信息】（请根据实际列名填写 parameters）
+{schema_info}
+
+输出 JSON 格式：{{"report_only": true/false, "charts_only": true/false, "tasks": [{{"tool_name": "工具名", "parameters": {{...}}}}]}}
+
+【意图判断】report_only（只要报告不要图）、charts_only（只要图不要报告），两者可均为 false。
+
+【任务规划 - 严格按用户要求，禁止添加多余步骤】
+- 用户说"只要X"或"只X"时，严格只规划 X，绝不多加其他任务。
+- 只要清洗/只要清洗后的数据 -> 只规划 clean_data
+- 只要归一化 -> 只规划 normalize_data
+- 录井综合分析/气测解释/显示评价 -> analyze_mud_gas_survey；需要深度剖面多道图 -> plot_mud_gas_profile；两参数交会 -> plot_crossplot；多列相关 -> plot_heatmap
+- 不要规划 interpret_lithology、identify_reservoir、plot_well_log_curves、plot_lithology_distribution、plot_reservoir_profile（当前文件不是测井曲线表）
+- 只要报告 -> 只 analyze_mud_gas_survey，不规划 plot_*
+- report_only 时：只 analyze_mud_gas_survey，不 plot
+- charts_only 时：只 plot_*（如 plot_mud_gas_profile），不重复 analyze（除非作图需要）
+- 不要默认添加 clean_data、normalize_data，除非用户明确要求清洗/归一化
+
+可用 tool_name：preview_data, clean_data, normalize_data, analyze_mud_gas_survey, plot_mud_gas_profile, plot_crossplot, plot_heatmap
+"""
+            else:
+                analysis_prompt = f"""当前日期: {current_date}
 用户请求: {user_request}
 数据文件: {file_path}
 
@@ -669,8 +794,8 @@ class SupervisorAgent:
 
             # 任务校验与过滤
             tasks, report_only, charts_only = parsed
-            tasks = _validate_and_sort_tasks(tasks)
-            tasks, is_data_only = _apply_report_only_filter(tasks, report_only, user_request)
+            tasks = _validate_and_sort_tasks(tasks, data_kind)
+            tasks, is_data_only = _apply_report_only_filter(tasks, report_only, user_request, data_kind)
 
             if not tasks:
                 await self._emit_workflow_log(event_callback, "未解析出有效工具任务，输出提示说明")
@@ -732,15 +857,20 @@ class SupervisorAgent:
 {json.dumps(tool_results, indent=2, ensure_ascii=False)}
 
 请基于这些结果，为用户生成报告，要求：
+- **禁止**输出任务规划类 JSON（如 `{{"tasks":`、`task_id`、`report_generation` 等）；不要写代码围栏包裹的 JSON；仅输出 Markdown 报告正文
 - 直接以 # 摘要 开头，不要任何对话式前导（如"根据您的要求""好的，以下是"等）
 - 若用户明确只要报告、只要简要结论，则输出简洁版：摘要+核心结论；但若工具结果中含岩性解释（interpret_lithology），仍须在「岩性解释」小节保留测井机理与分类依据等核心专业表述，不得仅列百分比
-- 使用 Markdown 排版：# 摘要、# 岩性解释（当工具结果含岩性解释或岩性统计时必填）、# 储层识别与评价（如适用）、# 结论
+- 当 interpret_lithology 的输出中含「一、数据概况」「四、深度段划分」「五、储层与含油气性提示」等结构化段落时，报告应**吸收并整理**其中的井段范围、有效段、深度段表与规则化储层提示，并在此基础上撰写专业叙述；勿忽略深度段 CSV（*_lithology_segments.csv）所对应的文字摘要
+- 用户未强调「极简」时，岩性解释小节应写细写透：覆盖参与曲线列名、数据质量/无效段提示、各类岩性占比与主控岩性、至少若干代表性深度段（顶深、底深、厚度量级或合并段）的文字归纳，以及规则化储层提示；所有数字、井段、分箱米数须与工具 JSON 一致，禁止臆造
+- 不要将「深度段划分」整表原样粘贴；应提炼为叙述，必要时仅保留关键几行说明
+- 若工具结果中含录井气测分析（analyze_mud_gas_survey），须设「录井气测分析」小节：钻时统计、全烃与组分异常段、干湿趋势、显示段与工具阈值一致；明确录井半定量、迟到时间校正与试油验证等局限；勿与测井岩性解释混为一谈
+- 使用 Markdown 排版：# 摘要、# 岩性解释（当工具结果含岩性解释或岩性统计时必填）、# 录井气测分析（当含 analyze_mud_gas_survey 时必填）、# 储层识别与评价（如适用）、# 结论
 - 岩性解释章节须专业、详实（在工具结果适用时）：
-  - 阐明自然伽马、密度、中子（若参与分类）等曲线在本井数据中的地球物理含义，及其与泥质含量、孔隙度、岩性骨架的典型响应关系
-  - 结合工具输出中的分类规则与阈值，说明各类岩性（如砂岩、灰岩、泥岩、粉砂岩等）划分的测井依据，避免只报数字
+  - 阐明自然伽马、密度、中子、深电阻率、自然电位、声波时差（若数据中存在且工具已用）的指示意义，及其与泥质、孔隙、流体性质的关系
+  - 结合工具输出中的分类规则与阈值，说明各类岩性（含灰岩、泥岩、砂岩、粉砂岩、致密砂岩、泥质粉砂岩、含油气显示砂岩等；后者仅为测井规则化标签，非试油结论）的划分依据，避免只报数字
   - 定量综述各岩性厚度占比或样本占比，指出主控岩性；若数据支持，可简述垂向变化或沉积—成岩意义上的解读（表述需与数据一致，不作无依据推断）
   - 说明本解释方法的假设与局限（如缺密度曲线时灰岩判识的变化、井眼与流体影响等），并给出可复核或后续验证建议
-  - 术语与表述宜符合油气测井解释惯例，可参照行业通用认识（如 SY/T 相关测井解释规范中的曲线选用与解释思路），文风严谨、条理分层
+  - 术语与表述宜符合油气测井解释惯例，可参照行业通用认识（如 SY/T 相关测井解释规范中的曲线选用与解释思路），文风严谨、条理分层；小节内可用多级列表，便于审阅
 - 不要使用星号(*)做粗体/斜体，不要直接输出 JSON
 - 输出内容中禁止出现 * 符号
 - 若有工具返回"跳过: 数据无法生成该图表 - ..."，请在报告中明确写出：哪些图表未生成、未生成的原因，以便用户了解
@@ -802,12 +932,15 @@ class SupervisorAgent:
         数据链依赖：
         - plot_lithology_distribution 必须使用 interpret_lithology 输出的岩性 CSV
         - plot_reservoir_profile 必须使用 identify_reservoir 输出的储层 CSV
+        - analyze_mud_gas_survey / plot_mud_gas_profile 使用清洗/归一化后的 data 或原始文件
         - 其他工具使用 data 路径（清洗/归一化后的数据或原始文件）
         """
         if tool_name == "plot_lithology_distribution":
             return path_state.get("interpret_lithology", path_state.get("data", file_path))
         if tool_name == "plot_reservoir_profile":
             return path_state.get("identify_reservoir", path_state.get("data", file_path))
+        if tool_name in ("analyze_mud_gas_survey", "plot_mud_gas_profile"):
+            return path_state.get("data", file_path)
         return path_state.get("data", file_path)
 
     async def _run_single_task(
@@ -843,7 +976,7 @@ class SupervisorAgent:
         # 绘图前可行性校验：若数据列不满足图表要求，则跳过执行并记录原因
         if agent_type == "expert" and tool_name in (
             "plot_well_log_curves", "plot_lithology_distribution", "plot_crossplot",
-            "plot_heatmap", "plot_reservoir_profile",
+            "plot_heatmap", "plot_reservoir_profile", "plot_mud_gas_profile",
         ):
             can_run, skip_reason = validate_plot_task_feasibility(tool_name, input_path, params)
             if not can_run:
@@ -962,6 +1095,8 @@ class SupervisorAgent:
             return "相关性热力图"
         if "_reservoir_profile" in name:
             return "储层剖面图"
+        if "_mud_gas_profile" in name:
+            return "录井气测剖面图"
         return "图表"
 
     def _extract_chart_paths(

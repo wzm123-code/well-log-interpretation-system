@@ -8,6 +8,8 @@ import os
 
 import pandas as pd
 
+from tools.data_loader import sanitize_well_log_dataframe
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,7 @@ def excel_to_csv(file_path: str, suffix: str = "_data") -> str:
         except Exception as e2:
             logger.error(f"Excel 转 CSV 失败: {e2}")
             return file_path
+    df = sanitize_well_log_dataframe(df)
     dir_name = os.path.dirname(file_path)
     base = os.path.splitext(os.path.basename(file_path))[0]
     csv_path = os.path.join(dir_name, f"{base}{suffix}.csv")
